@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { ChangeEvent, DragEvent } from 'react'
+import type { ChangeEvent, DragEvent, MutableRefObject } from 'react'
 import JSZip from 'jszip'
 import {
   Archive,
@@ -124,6 +124,7 @@ function App() {
   const resultsRef = useRef<ConversionResult[]>([])
   const ffmpegToolsRef = useRef<FfmpegTools | null>(null)
   const ffmpegLoadRef = useRef<Promise<FfmpegTools> | null>(null)
+  const ffmpegLogRef = useRef<string[]>([])
   const progressContextRef = useRef<{ index: number; total: number } | null>(null)
 
   const imageFormat = IMAGE_FORMATS.find((format) => format.value === settings.imageFormat) ?? IMAGE_FORMATS[0]
@@ -262,7 +263,7 @@ function App() {
           current.map((fileItem) => (fileItem.id === item.id ? { ...fileItem, status: 'done' } : fileItem)),
         )
       } catch (error) {
-        const message = error instanceof Error ? error.message : 'Conversion failed.'
+        const message = getErrorMessage(error)
         setFiles((current) =>
           current.map((fileItem) =>
             fileItem.id === item.id ? { ...fileItem, status: 'failed', error: message } : fileItem,
@@ -347,7 +348,11 @@ function App() {
 
       const ffmpeg = new FfmpegClass()
       ffmpeg.on('log', ({ message }) => {
-        if (message.trim()) setFfmpegMessage(message.trim().slice(0, 180))
+        const trimmed = message.trim()
+        if (!trimmed || trimmed === 'Aborted()') return
+
+        ffmpegLogRef.current = [...ffmpegLogRef.current.slice(-79), trimmed]
+        setFfmpegMessage(trimmed.slice(0, 220))
       })
       ffmpeg.on('progress', ({ progress: ffmpegProgress }) => {
         const context = progressContextRef.current
@@ -383,36 +388,76 @@ function App() {
     const tools = await ensureFfmpeg()
     const inputName = `input_${item.id}.${getExtension(item.file.name) || 'media'}`
     const outputName = buildOutputName(settings.filePrefix, item.file.name, videoFormat.extension)
-    const args = buildVideoArgs(
-      inputName,
-      outputName,
-      videoFormat.value,
-      settings.quality,
-      parsePositiveNumber(settings.videoMaxWidth),
-      settings.stripAudio,
-    )
+    const maxVideoWidth = parsePositiveNumber(settings.videoMaxWidth)
+    let convertedBlob: Blob | null = null
 
     progressContextRef.current = { index, total }
+    ffmpegLogRef.current = []
 
     try {
       await tools.ffmpeg.writeFile(inputName, await tools.fetchFile(item.file))
-      const exitCode = await tools.ffmpeg.exec(args)
-      if (exitCode !== 0) throw new Error(`FFmpeg exited with code ${exitCode}.`)
 
-      const data = await tools.ffmpeg.readFile(outputName)
-      const sourceBytes = data instanceof Uint8Array ? data : new TextEncoder().encode(data)
-      const binary = new Uint8Array(sourceBytes.length)
-      binary.set(sourceBytes)
-      const blob = new Blob([binary.buffer], { type: videoFormat.mime })
+      try {
+        await runFfmpeg(
+          tools.ffmpeg,
+          buildVideoArgs(inputName, outputName, videoFormat.value, settings.quality, maxVideoWidth, settings.stripAudio),
+          ffmpegLogRef,
+        )
+      } catch (error) {
+        if (settings.stripAudio || videoFormat.value === 'gif') {
+          if (canUseBrowserVideoFallback(videoFormat.value)) {
+            convertedBlob = await convertWithBrowserVideoFallback(
+              item.file,
+              videoFormat.value,
+              settings.quality,
+              maxVideoWidth,
+              index,
+              total,
+            )
+          } else {
+            throw error
+          }
+        } else {
+          try {
+            setFfmpegMessage('Retrying without audio...')
+            ffmpegLogRef.current = []
+            await safeDelete(tools.ffmpeg, outputName)
+            await runFfmpeg(
+              tools.ffmpeg,
+              buildVideoArgs(inputName, outputName, videoFormat.value, settings.quality, maxVideoWidth, true),
+              ffmpegLogRef,
+            )
+          } catch (retryError) {
+            if (!canUseBrowserVideoFallback(videoFormat.value)) throw retryError
+
+            convertedBlob = await convertWithBrowserVideoFallback(
+              item.file,
+              videoFormat.value,
+              settings.quality,
+              maxVideoWidth,
+              index,
+              total,
+            )
+          }
+        }
+      }
+
+      if (!convertedBlob) {
+        const data = await tools.ffmpeg.readFile(outputName)
+        const sourceBytes = data instanceof Uint8Array ? data : new TextEncoder().encode(data)
+        const binary = new Uint8Array(sourceBytes.length)
+        binary.set(sourceBytes)
+        convertedBlob = new Blob([binary.buffer], { type: videoFormat.mime })
+      }
 
       return {
         id: makeId(),
         sourceName: item.file.name,
         outputName,
         originalSize: item.file.size,
-        convertedSize: blob.size,
-        blob,
-        url: URL.createObjectURL(blob),
+        convertedSize: convertedBlob.size,
+        blob: convertedBlob,
+        url: URL.createObjectURL(convertedBlob),
         previewType: videoFormat.value === 'gif' ? 'image' : 'video',
       }
     } finally {
@@ -420,6 +465,28 @@ function App() {
       await safeDelete(tools.ffmpeg, inputName)
       await safeDelete(tools.ffmpeg, outputName)
     }
+  }
+
+  async function convertWithBrowserVideoFallback(
+    file: File,
+    format: VideoFormat,
+    quality: number,
+    maxWidth: number | null,
+    index: number,
+    total: number,
+  ) {
+    setFfmpegMessage(`Using browser ${format.toUpperCase()} encoder fallback. Audio will be removed.`)
+    ffmpegToolsRef.current?.ffmpeg.terminate()
+    ffmpegToolsRef.current = null
+
+    return convertVideoWithMediaRecorder(file, format, quality, maxWidth, (percent) => {
+      setProgress({
+        label: `Encoding ${format.toUpperCase()}`,
+        current: index,
+        total,
+        percent: Math.min(99, Math.round(((index + percent) / total) * 100)),
+      })
+    })
   }
 
   async function downloadAllAsZip() {
@@ -866,12 +933,12 @@ function buildVideoArgs(
   stripAudio: boolean,
 ) {
   const crf = String(Math.round(35 - quality * 17))
-  const vp9Crf = String(Math.round(48 - quality * 33))
+  const webmBitrate = quality >= 0.85 ? '2600k' : quality >= 0.7 ? '1700k' : '950k'
   const audioArgs = stripAudio ? ['-an'] : ['-map', '0:a:0?', '-c:a', 'aac', '-b:a', '128k']
   const opusAudioArgs = stripAudio ? ['-an'] : ['-map', '0:a:0?', '-c:a', 'libopus', '-b:a', '96k']
-  const scaleFilter = maxWidth ? `scale=w='min(${maxWidth},iw)':h=-2` : ''
+  const scaleFilter = buildEvenScaleFilter(maxWidth)
   const videoMap = ['-map', '0:v:0']
-  const filterArgs = scaleFilter ? ['-vf', scaleFilter] : []
+  const filterArgs = ['-vf', scaleFilter]
 
   if (format === 'webm') {
     return [
@@ -881,11 +948,16 @@ function buildVideoArgs(
       ...opusAudioArgs,
       ...filterArgs,
       '-c:v',
-      'libvpx-vp9',
+      'libvpx',
+      '-deadline',
+      'realtime',
+      '-cpu-used',
+      '8',
       '-b:v',
-      '0',
-      '-crf',
-      vp9Crf,
+      webmBitrate,
+      '-pix_fmt',
+      'yuv420p',
+      '-shortest',
       outputName,
     ]
   }
@@ -905,12 +977,13 @@ function buildVideoArgs(
       crf,
       '-pix_fmt',
       'yuv420p',
+      '-shortest',
       outputName,
     ]
   }
 
   if (format === 'gif') {
-    const gifScale = maxWidth ? scaleFilter : "scale=w='min(720,iw)':h=-2"
+    const gifScale = buildEvenScaleFilter(maxWidth ?? 720)
     return [
       '-i',
       inputName,
@@ -936,10 +1009,165 @@ function buildVideoArgs(
     crf,
     '-pix_fmt',
     'yuv420p',
+    '-shortest',
     '-movflags',
     'faststart',
     outputName,
   ]
+}
+
+function canUseBrowserVideoFallback(format: VideoFormat) {
+  return format === 'webm' || format === 'mp4'
+}
+
+async function convertVideoWithMediaRecorder(
+  file: File,
+  format: VideoFormat,
+  quality: number,
+  maxWidth: number | null,
+  onProgress: (percent: number) => void,
+) {
+  if (typeof MediaRecorder === 'undefined') {
+    throw new Error('This browser does not support the fallback video encoder.')
+  }
+
+  const mimeType = getRecorderMimeType(format)
+  if (!mimeType) {
+    throw new Error(`This browser cannot record ${format.toUpperCase()} output.`)
+  }
+
+  const sourceUrl = URL.createObjectURL(file)
+  const video = document.createElement('video')
+  video.src = sourceUrl
+  video.muted = true
+  video.playsInline = true
+  video.preload = 'auto'
+
+  try {
+    await waitForMediaEvent(video, 'loadedmetadata')
+
+    const { width, height } = calculateVideoSize(video.videoWidth, video.videoHeight, maxWidth)
+    const canvas = document.createElement('canvas')
+    canvas.width = width
+    canvas.height = height
+
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('Canvas rendering is not available in this browser.')
+
+    const stream = canvas.captureStream(30)
+    const recorder = new MediaRecorder(stream, {
+      mimeType,
+      videoBitsPerSecond: quality >= 0.85 ? 2_600_000 : quality >= 0.7 ? 1_700_000 : 950_000,
+    })
+
+    const chunks: Blob[] = []
+    let animationFrame = 0
+
+    const stopped = new Promise<Blob>((resolve, reject) => {
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) chunks.push(event.data)
+      }
+      recorder.onerror = () => reject(new Error(`Browser ${format.toUpperCase()} encoding failed.`))
+      recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }))
+    })
+
+    const draw = () => {
+      context.drawImage(video, 0, 0, width, height)
+      if (Number.isFinite(video.duration) && video.duration > 0) {
+        onProgress(Math.min(0.99, video.currentTime / video.duration))
+      }
+      if (!video.ended && !video.paused) animationFrame = requestAnimationFrame(draw)
+    }
+
+    recorder.start(250)
+    await video.play()
+    draw()
+    await waitForMediaEvent(video, 'ended')
+    cancelAnimationFrame(animationFrame)
+    if (recorder.state !== 'inactive') recorder.stop()
+
+    const blob = await stopped
+    if (blob.size === 0) throw new Error(`Browser ${format.toUpperCase()} encoder produced an empty file.`)
+    return blob
+  } finally {
+    URL.revokeObjectURL(sourceUrl)
+  }
+}
+
+function getRecorderMimeType(format: VideoFormat) {
+  const candidates =
+    format === 'mp4'
+      ? ['video/mp4;codecs=avc1.42E01E', 'video/mp4']
+      : ['video/webm;codecs=vp8', 'video/webm']
+
+  return candidates.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) ?? ''
+}
+
+function waitForMediaEvent(element: HTMLMediaElement, eventName: 'loadedmetadata' | 'ended') {
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      element.removeEventListener(eventName, handleEvent)
+      element.removeEventListener('error', handleError)
+    }
+    const handleEvent = () => {
+      cleanup()
+      resolve()
+    }
+    const handleError = () => {
+      cleanup()
+      reject(new Error('The video could not be decoded by the browser.'))
+    }
+
+    element.addEventListener(eventName, handleEvent, { once: true })
+    element.addEventListener('error', handleError, { once: true })
+  })
+}
+
+function calculateVideoSize(originalWidth: number, originalHeight: number, maxWidth: number | null) {
+  const targetWidth = maxWidth ? Math.min(maxWidth, originalWidth) : originalWidth
+  const evenWidth = Math.max(2, Math.floor(targetWidth / 2) * 2)
+  const scaledHeight = Math.round((originalHeight / originalWidth) * evenWidth)
+  const evenHeight = Math.max(2, Math.floor(scaledHeight / 2) * 2)
+
+  return { width: evenWidth, height: evenHeight }
+}
+
+async function runFfmpeg(
+  ffmpeg: FFmpeg,
+  args: string[],
+  logRef: MutableRefObject<string[]>,
+) {
+  try {
+    const exitCode = await ffmpeg.exec(args)
+    if (exitCode !== 0) {
+      throw new Error(`FFmpeg exited with code ${exitCode}.`)
+    }
+  } catch (error) {
+    throw new Error(buildFfmpegErrorMessage(error, logRef.current), { cause: error })
+  }
+}
+
+function buildEvenScaleFilter(maxWidth: number | null) {
+  if (!maxWidth) {
+    return "scale=w='trunc(iw/2)*2':h='trunc(ih/2)*2',setsar=1"
+  }
+
+  const evenMaxWidth = Math.max(2, Math.floor(maxWidth / 2) * 2)
+  return `scale=w='trunc(min(${evenMaxWidth},iw)/2)*2':h=-2,setsar=1`
+}
+
+function buildFfmpegErrorMessage(error: unknown, logs: string[]) {
+  const baseMessage = getErrorMessage(error)
+  const usefulLine = [...logs]
+    .reverse()
+    .find((line) =>
+      /error|invalid|failed|unable|unknown|not found|not supported|cannot|could not|too large|abort/i.test(line),
+    )
+  const fallbackLine = logs.findLast((line) => !line.startsWith('frame=')) ?? logs.at(-1)
+  const detail = usefulLine ?? fallbackLine
+
+  if (!detail || baseMessage.includes(detail)) return baseMessage
+  return `${baseMessage} ${detail}`.slice(0, 260)
 }
 
 async function safeDelete(ffmpeg: FFmpeg, path: string) {
@@ -948,6 +1176,12 @@ async function safeDelete(ffmpeg: FFmpeg, path: string) {
   } catch {
     // Missing files are fine after a failed conversion.
   }
+}
+
+function getErrorMessage(error: unknown) {
+  if (error instanceof Error && error.message) return error.message
+  if (typeof error === 'string' && error.trim()) return error.trim()
+  return 'Conversion failed.'
 }
 
 function buildOutputName(prefix: string, originalName: string, extension: string) {
