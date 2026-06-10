@@ -1,0 +1,1007 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { ChangeEvent, DragEvent } from 'react'
+import JSZip from 'jszip'
+import {
+  Archive,
+  CheckCircle2,
+  Download,
+  FileArchive,
+  Image as ImageIcon,
+  Loader2,
+  Moon,
+  Play,
+  RefreshCw,
+  Settings2,
+  Sun,
+  Trash2,
+  Upload,
+  Video,
+  XCircle,
+} from 'lucide-react'
+import type { FFmpeg } from '@ffmpeg/ffmpeg'
+import './App.css'
+
+const IMAGE_FORMATS = [
+  { value: 'webp', label: 'WebP', extension: 'webp', mime: 'image/webp', quality: true },
+  { value: 'jpeg', label: 'JPEG', extension: 'jpg', mime: 'image/jpeg', quality: true },
+  { value: 'png', label: 'PNG', extension: 'png', mime: 'image/png', quality: false },
+  { value: 'avif', label: 'AVIF', extension: 'avif', mime: 'image/avif', quality: true },
+] as const
+
+const VIDEO_FORMATS = [
+  { value: 'mp4', label: 'MP4', extension: 'mp4', mime: 'video/mp4' },
+  { value: 'webm', label: 'WebM', extension: 'webm', mime: 'video/webm' },
+  { value: 'mov', label: 'MOV', extension: 'mov', mime: 'video/quicktime' },
+  { value: 'gif', label: 'GIF', extension: 'gif', mime: 'image/gif' },
+] as const
+
+type Mode = 'image' | 'video'
+type Theme = 'light' | 'dark'
+type FileStatus = 'ready' | 'working' | 'done' | 'failed'
+type ImageFormat = (typeof IMAGE_FORMATS)[number]['value']
+type VideoFormat = (typeof VIDEO_FORMATS)[number]['value']
+type FetchFile = (file?: string | File | Blob) => Promise<Uint8Array>
+
+type MediaFile = {
+  id: string
+  file: File
+  previewUrl: string
+  status: FileStatus
+  error?: string
+}
+
+type ConversionResult = {
+  id: string
+  sourceName: string
+  outputName: string
+  originalSize: number
+  convertedSize: number
+  blob: Blob
+  url: string
+  previewType: Mode
+}
+
+type ConverterSettings = {
+  theme: Theme
+  imageFormat: ImageFormat
+  videoFormat: VideoFormat
+  quality: number
+  maxWidth: string
+  maxHeight: string
+  keepAspect: boolean
+  filePrefix: string
+  videoMaxWidth: string
+  stripAudio: boolean
+}
+
+type FfmpegTools = {
+  ffmpeg: FFmpeg
+  fetchFile: FetchFile
+}
+
+type ProgressState = {
+  label: string
+  current: number
+  total: number
+  percent: number
+}
+
+const DEFAULT_SETTINGS: ConverterSettings = {
+  theme: 'dark',
+  imageFormat: 'webp',
+  videoFormat: 'mp4',
+  quality: 0.8,
+  maxWidth: '',
+  maxHeight: '',
+  keepAspect: true,
+  filePrefix: 'converted_',
+  videoMaxWidth: '1280',
+  stripAudio: false,
+}
+
+const SETTINGS_KEY = 'react-media-format-converter-settings'
+const MAX_IMAGE_FILES = 100
+const MAX_VIDEO_FILES = 10
+
+function App() {
+  const [mode, setMode] = useState<Mode>('image')
+  const [settings, setSettings] = useState<ConverterSettings>(loadSettings)
+  const [files, setFiles] = useState<MediaFile[]>([])
+  const [results, setResults] = useState<ConversionResult[]>([])
+  const [isDragging, setIsDragging] = useState(false)
+  const [isWorking, setIsWorking] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [ffmpegMessage, setFfmpegMessage] = useState('')
+  const [progress, setProgress] = useState<ProgressState>({
+    label: 'Waiting',
+    current: 0,
+    total: 0,
+    percent: 0,
+  })
+
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const filesRef = useRef<MediaFile[]>([])
+  const resultsRef = useRef<ConversionResult[]>([])
+  const ffmpegToolsRef = useRef<FfmpegTools | null>(null)
+  const ffmpegLoadRef = useRef<Promise<FfmpegTools> | null>(null)
+  const progressContextRef = useRef<{ index: number; total: number } | null>(null)
+
+  const imageFormat = IMAGE_FORMATS.find((format) => format.value === settings.imageFormat) ?? IMAGE_FORMATS[0]
+  const videoFormat = VIDEO_FORMATS.find((format) => format.value === settings.videoFormat) ?? VIDEO_FORMATS[0]
+  const maxFiles = mode === 'image' ? MAX_IMAGE_FILES : MAX_VIDEO_FILES
+  const accept = mode === 'image' ? 'image/*' : 'video/*'
+  const canConvert = files.length > 0 && !isWorking
+  const canDownloadAll = results.length > 0 && !isWorking
+
+  const summary = useMemo(() => {
+    const original = results.reduce((total, result) => total + result.originalSize, 0)
+    const converted = results.reduce((total, result) => total + result.convertedSize, 0)
+    const saved = original > 0 ? ((original - converted) / original) * 100 : 0
+    return { original, converted, saved }
+  }, [results])
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = settings.theme
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings))
+  }, [settings])
+
+  useEffect(() => {
+    filesRef.current = files
+  }, [files])
+
+  useEffect(() => {
+    resultsRef.current = results
+  }, [results])
+
+  useEffect(() => {
+    return () => {
+      filesRef.current.forEach((item) => URL.revokeObjectURL(item.previewUrl))
+      resultsRef.current.forEach((result) => URL.revokeObjectURL(result.url))
+      ffmpegToolsRef.current?.ffmpeg.terminate()
+    }
+  }, [])
+
+  function updateSetting<Key extends keyof ConverterSettings>(key: Key, value: ConverterSettings[Key]) {
+    setSettings((current) => ({ ...current, [key]: value }))
+  }
+
+  function resetOutput() {
+    resultsRef.current.forEach((result) => URL.revokeObjectURL(result.url))
+    resultsRef.current = []
+    setResults([])
+  }
+
+  function clearFiles() {
+    filesRef.current.forEach((item) => URL.revokeObjectURL(item.previewUrl))
+    filesRef.current = []
+    setFiles([])
+    resetOutput()
+    setNotice(null)
+    setProgress({ label: 'Waiting', current: 0, total: 0, percent: 0 })
+  }
+
+  function changeMode(nextMode: Mode) {
+    if (nextMode === mode || isWorking) return
+    clearFiles()
+    setMode(nextMode)
+    setFfmpegMessage('')
+  }
+
+  function addFiles(incomingFiles: File[]) {
+    const acceptedFiles = incomingFiles.filter((file) =>
+      mode === 'image' ? file.type.startsWith('image/') : file.type.startsWith('video/'),
+    )
+
+    if (acceptedFiles.length === 0) {
+      setNotice(`Choose ${mode === 'image' ? 'image' : 'video'} files for the active converter.`)
+      return
+    }
+
+    const room = maxFiles - filesRef.current.length
+    if (room <= 0) {
+      setNotice(`The ${mode} converter accepts up to ${maxFiles} files at once.`)
+      return
+    }
+
+    const nextFiles = acceptedFiles.slice(0, room).map<MediaFile>((file) => ({
+      id: makeId(),
+      file,
+      previewUrl: URL.createObjectURL(file),
+      status: 'ready',
+    }))
+
+    setFiles((current) => [...current, ...nextFiles])
+    resetOutput()
+    setNotice(acceptedFiles.length > room ? `Added ${room} files. The rest were skipped.` : null)
+  }
+
+  function handleFileInput(event: ChangeEvent<HTMLInputElement>) {
+    addFiles(Array.from(event.target.files ?? []))
+    event.target.value = ''
+  }
+
+  function handleDrop(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault()
+    setIsDragging(false)
+    addFiles(Array.from(event.dataTransfer.files))
+  }
+
+  function removeFile(id: string) {
+    const target = filesRef.current.find((item) => item.id === id)
+    if (target) URL.revokeObjectURL(target.previewUrl)
+    setFiles((current) => current.filter((item) => item.id !== id))
+    resetOutput()
+  }
+
+  async function convertAll() {
+    if (!canConvert) return
+
+    resetOutput()
+    setIsWorking(true)
+    setNotice(null)
+    setFfmpegMessage('')
+    setFiles((current) => current.map((item) => ({ ...item, status: 'ready', error: undefined })))
+    setProgress({ label: 'Starting', current: 0, total: filesRef.current.length, percent: 0 })
+
+    const converted: ConversionResult[] = []
+    const selectedFiles = [...filesRef.current]
+
+    for (let index = 0; index < selectedFiles.length; index += 1) {
+      const item = selectedFiles[index]
+      setFiles((current) =>
+        current.map((fileItem) => (fileItem.id === item.id ? { ...fileItem, status: 'working' } : fileItem)),
+      )
+
+      try {
+        const result =
+          mode === 'image'
+            ? await convertImage(item)
+            : await convertVideo(item, index, selectedFiles.length)
+        converted.push(result)
+        setFiles((current) =>
+          current.map((fileItem) => (fileItem.id === item.id ? { ...fileItem, status: 'done' } : fileItem)),
+        )
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Conversion failed.'
+        setFiles((current) =>
+          current.map((fileItem) =>
+            fileItem.id === item.id ? { ...fileItem, status: 'failed', error: message } : fileItem,
+          ),
+        )
+      }
+
+      const complete = index + 1
+      setProgress({
+        label: complete === selectedFiles.length ? 'Complete' : 'Converting',
+        current: complete,
+        total: selectedFiles.length,
+        percent: Math.round((complete / selectedFiles.length) * 100),
+      })
+    }
+
+    setResults(converted)
+    setIsWorking(false)
+    setNotice(converted.length === 0 ? 'No files were converted. Check the file list for errors.' : null)
+  }
+
+  async function convertImage(item: MediaFile): Promise<ConversionResult> {
+    const image = await loadImage(item.file)
+    const size = calculateImageSize(
+      image.naturalWidth,
+      image.naturalHeight,
+      parsePositiveNumber(settings.maxWidth),
+      parsePositiveNumber(settings.maxHeight),
+      settings.keepAspect,
+    )
+
+    const canvas = document.createElement('canvas')
+    canvas.width = size.width
+    canvas.height = size.height
+
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('Canvas rendering is not available in this browser.')
+
+    context.imageSmoothingEnabled = true
+    context.imageSmoothingQuality = 'high'
+
+    if (imageFormat.mime === 'image/jpeg') {
+      context.fillStyle = '#ffffff'
+      context.fillRect(0, 0, canvas.width, canvas.height)
+    }
+
+    context.drawImage(image, 0, 0, size.width, size.height)
+
+    const blob = await canvasToBlob(
+      canvas,
+      imageFormat.mime,
+      imageFormat.quality ? settings.quality : undefined,
+    )
+
+    if (!blob || (blob.type && blob.type !== imageFormat.mime && imageFormat.value !== 'png')) {
+      throw new Error(`${imageFormat.label} output is not supported by this browser.`)
+    }
+
+    const outputName = buildOutputName(settings.filePrefix, item.file.name, imageFormat.extension)
+    return {
+      id: makeId(),
+      sourceName: item.file.name,
+      outputName,
+      originalSize: item.file.size,
+      convertedSize: blob.size,
+      blob,
+      url: URL.createObjectURL(blob),
+      previewType: 'image',
+    }
+  }
+
+  async function ensureFfmpeg(): Promise<FfmpegTools> {
+    if (ffmpegToolsRef.current?.ffmpeg.loaded) return ffmpegToolsRef.current
+    if (ffmpegLoadRef.current) return ffmpegLoadRef.current
+
+    ffmpegLoadRef.current = (async () => {
+      setFfmpegMessage('Loading FFmpeg engine...')
+      const [{ FFmpeg: FfmpegClass }, { fetchFile }] = await Promise.all([
+        import('@ffmpeg/ffmpeg'),
+        import('@ffmpeg/util'),
+      ])
+
+      const ffmpeg = new FfmpegClass()
+      ffmpeg.on('log', ({ message }) => {
+        if (message.trim()) setFfmpegMessage(message.trim().slice(0, 180))
+      })
+      ffmpeg.on('progress', ({ progress: ffmpegProgress }) => {
+        const context = progressContextRef.current
+        if (!context) return
+        const percent = ((context.index + Math.max(0, Math.min(1, ffmpegProgress))) / context.total) * 100
+        setProgress({
+          label: 'Encoding video',
+          current: context.index,
+          total: context.total,
+          percent: Math.min(99, Math.round(percent)),
+        })
+      })
+
+      await ffmpeg.load({
+        coreURL: assetUrl('ffmpeg/ffmpeg-core.js'),
+        wasmURL: assetUrl('ffmpeg/ffmpeg-core.wasm'),
+      })
+
+      const tools = { ffmpeg, fetchFile }
+      ffmpegToolsRef.current = tools
+      setFfmpegMessage('FFmpeg engine ready.')
+      return tools
+    })()
+
+    try {
+      return await ffmpegLoadRef.current
+    } finally {
+      ffmpegLoadRef.current = null
+    }
+  }
+
+  async function convertVideo(item: MediaFile, index: number, total: number): Promise<ConversionResult> {
+    const tools = await ensureFfmpeg()
+    const inputName = `input_${item.id}.${getExtension(item.file.name) || 'media'}`
+    const outputName = buildOutputName(settings.filePrefix, item.file.name, videoFormat.extension)
+    const args = buildVideoArgs(
+      inputName,
+      outputName,
+      videoFormat.value,
+      settings.quality,
+      parsePositiveNumber(settings.videoMaxWidth),
+      settings.stripAudio,
+    )
+
+    progressContextRef.current = { index, total }
+
+    try {
+      await tools.ffmpeg.writeFile(inputName, await tools.fetchFile(item.file))
+      const exitCode = await tools.ffmpeg.exec(args)
+      if (exitCode !== 0) throw new Error(`FFmpeg exited with code ${exitCode}.`)
+
+      const data = await tools.ffmpeg.readFile(outputName)
+      const sourceBytes = data instanceof Uint8Array ? data : new TextEncoder().encode(data)
+      const binary = new Uint8Array(sourceBytes.length)
+      binary.set(sourceBytes)
+      const blob = new Blob([binary.buffer], { type: videoFormat.mime })
+
+      return {
+        id: makeId(),
+        sourceName: item.file.name,
+        outputName,
+        originalSize: item.file.size,
+        convertedSize: blob.size,
+        blob,
+        url: URL.createObjectURL(blob),
+        previewType: videoFormat.value === 'gif' ? 'image' : 'video',
+      }
+    } finally {
+      progressContextRef.current = null
+      await safeDelete(tools.ffmpeg, inputName)
+      await safeDelete(tools.ffmpeg, outputName)
+    }
+  }
+
+  async function downloadAllAsZip() {
+    if (!canDownloadAll) return
+
+    const zip = new JSZip()
+    results.forEach((result) => {
+      zip.file(result.outputName, result.blob)
+    })
+
+    const zipBlob = await zip.generateAsync({ type: 'blob' })
+    downloadBlob(zipBlob, mode === 'image' ? 'converted-images.zip' : 'converted-videos.zip')
+  }
+
+  return (
+    <main className="app-shell">
+      <header className="topbar">
+        <div className="brand">
+          <div className="brand-mark" aria-hidden="true">
+            <RefreshCw size={28} />
+          </div>
+          <div>
+            <h1>Media Format Converter</h1>
+            <p>Convert images and videos directly in your browser.</p>
+          </div>
+        </div>
+
+        <button
+          className="icon-button"
+          type="button"
+          title="Toggle theme"
+          aria-label="Toggle theme"
+          onClick={() => updateSetting('theme', settings.theme === 'dark' ? 'light' : 'dark')}
+        >
+          {settings.theme === 'dark' ? <Sun size={20} /> : <Moon size={20} />}
+        </button>
+      </header>
+
+      <section className="mode-bar" aria-label="Converter mode">
+        <button
+          className={mode === 'image' ? 'mode-button active' : 'mode-button'}
+          type="button"
+          onClick={() => changeMode('image')}
+          disabled={isWorking}
+        >
+          <ImageIcon size={18} />
+          Images
+        </button>
+        <button
+          className={mode === 'video' ? 'mode-button active' : 'mode-button'}
+          type="button"
+          onClick={() => changeMode('video')}
+          disabled={isWorking}
+        >
+          <Video size={18} />
+          Videos
+        </button>
+      </section>
+
+      <section
+        className={isDragging ? 'upload-panel drag-active' : 'upload-panel'}
+        onDragOver={(event) => {
+          event.preventDefault()
+          setIsDragging(true)
+        }}
+        onDragLeave={(event) => {
+          event.preventDefault()
+          setIsDragging(false)
+        }}
+        onDrop={handleDrop}
+        onClick={() => fileInputRef.current?.click()}
+      >
+        <input ref={fileInputRef} type="file" accept={accept} multiple hidden onChange={handleFileInput} />
+        <div className="upload-icon" aria-hidden="true">
+          <Upload size={34} />
+        </div>
+        <h2>Drop {mode === 'image' ? 'images' : 'videos'} here</h2>
+        <p>
+          {mode === 'image'
+            ? `PNG, JPG, WebP, AVIF, GIF, BMP and more. Up to ${MAX_IMAGE_FILES} files.`
+            : `MP4, WebM, MOV, MKV and other common video files. Up to ${MAX_VIDEO_FILES} files.`}
+        </p>
+        <button className="primary-button" type="button">
+          <Upload size={18} />
+          Choose Files
+        </button>
+      </section>
+
+      {notice ? (
+        <div className="notice" role="status">
+          {notice}
+        </div>
+      ) : null}
+
+      {files.length > 0 ? (
+        <section className="workspace-grid">
+          <div className="tool-panel">
+            <div className="panel-heading">
+              <div>
+                <span className="eyebrow">Queue</span>
+                <h2>{files.length} file{files.length === 1 ? '' : 's'} selected</h2>
+              </div>
+              <button
+                className="icon-button quiet"
+                type="button"
+                title="Clear files"
+                aria-label="Clear files"
+                onClick={clearFiles}
+                disabled={isWorking}
+              >
+                <Trash2 size={18} />
+              </button>
+            </div>
+
+            <div className="file-list">
+              {files.map((item) => (
+                <article className="file-row" key={item.id}>
+                  {mode === 'image' ? (
+                    <img src={item.previewUrl} alt="" className="file-preview" />
+                  ) : (
+                    <video src={item.previewUrl} className="file-preview" muted />
+                  )}
+                  <div className="file-meta">
+                    <strong>{item.file.name}</strong>
+                    <span>{formatBytes(item.file.size)}</span>
+                    {item.error ? <small>{item.error}</small> : null}
+                  </div>
+                  <StatusIcon status={item.status} />
+                  <button
+                    className="icon-button quiet"
+                    type="button"
+                    title="Remove file"
+                    aria-label={`Remove ${item.file.name}`}
+                    onClick={() => removeFile(item.id)}
+                    disabled={isWorking}
+                  >
+                    <Trash2 size={16} />
+                  </button>
+                </article>
+              ))}
+            </div>
+          </div>
+
+          <div className="tool-panel">
+            <div className="panel-heading">
+              <div>
+                <span className="eyebrow">Output</span>
+                <h2>Conversion settings</h2>
+              </div>
+              <Settings2 size={22} />
+            </div>
+
+            <div className="controls-grid">
+              <label className="field">
+                <span>Format</span>
+                <select
+                  value={mode === 'image' ? settings.imageFormat : settings.videoFormat}
+                  onChange={(event) =>
+                    mode === 'image'
+                      ? updateSetting('imageFormat', event.target.value as ImageFormat)
+                      : updateSetting('videoFormat', event.target.value as VideoFormat)
+                  }
+                  disabled={isWorking}
+                >
+                  {(mode === 'image' ? IMAGE_FORMATS : VIDEO_FORMATS).map((format) => (
+                    <option key={format.value} value={format.value}>
+                      {format.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="field">
+                <span>Quality: {Math.round(settings.quality * 100)}%</span>
+                <input
+                  type="range"
+                  min="0.1"
+                  max="1"
+                  step="0.05"
+                  value={settings.quality}
+                  onChange={(event) => updateSetting('quality', Number(event.target.value))}
+                  disabled={isWorking || (mode === 'image' && !imageFormat.quality)}
+                />
+              </label>
+
+              <div className="preset-group" aria-label="Quality presets">
+                {[0.9, 0.8, 0.6].map((value) => (
+                  <button
+                    key={value}
+                    className={Math.abs(settings.quality - value) < 0.01 ? 'preset-button active' : 'preset-button'}
+                    type="button"
+                    onClick={() => updateSetting('quality', value)}
+                    disabled={isWorking || (mode === 'image' && !imageFormat.quality)}
+                  >
+                    {value === 0.9 ? 'High' : value === 0.8 ? 'Balanced' : 'Small'} ({Math.round(value * 100)}%)
+                  </button>
+                ))}
+              </div>
+
+              {mode === 'image' ? (
+                <>
+                  <label className="field">
+                    <span>Max width</span>
+                    <input
+                      type="number"
+                      min="1"
+                      placeholder="Original"
+                      value={settings.maxWidth}
+                      onChange={(event) => updateSetting('maxWidth', event.target.value)}
+                      disabled={isWorking}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Max height</span>
+                    <input
+                      type="number"
+                      min="1"
+                      placeholder="Original"
+                      value={settings.maxHeight}
+                      onChange={(event) => updateSetting('maxHeight', event.target.value)}
+                      disabled={isWorking}
+                    />
+                  </label>
+                  <label className="toggle-row">
+                    <input
+                      type="checkbox"
+                      checked={settings.keepAspect}
+                      onChange={(event) => updateSetting('keepAspect', event.target.checked)}
+                      disabled={isWorking}
+                    />
+                    Maintain aspect ratio
+                  </label>
+                </>
+              ) : (
+                <>
+                  <label className="field">
+                    <span>Max video width</span>
+                    <input
+                      type="number"
+                      min="120"
+                      placeholder="Original"
+                      value={settings.videoMaxWidth}
+                      onChange={(event) => updateSetting('videoMaxWidth', event.target.value)}
+                      disabled={isWorking}
+                    />
+                  </label>
+                  <label className="toggle-row">
+                    <input
+                      type="checkbox"
+                      checked={settings.stripAudio}
+                      onChange={(event) => updateSetting('stripAudio', event.target.checked)}
+                      disabled={isWorking || videoFormat.value === 'gif'}
+                    />
+                    Remove audio
+                  </label>
+                </>
+              )}
+
+              <label className="field wide">
+                <span>File prefix</span>
+                <input
+                  type="text"
+                  value={settings.filePrefix}
+                  onChange={(event) => updateSetting('filePrefix', event.target.value)}
+                  disabled={isWorking}
+                />
+              </label>
+            </div>
+
+            <div className="action-row">
+              <button className="primary-button" type="button" onClick={convertAll} disabled={!canConvert}>
+                {isWorking ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
+                {isWorking ? 'Converting' : `Convert ${mode === 'image' ? 'Images' : 'Videos'}`}
+              </button>
+              <button className="secondary-button" type="button" onClick={downloadAllAsZip} disabled={!canDownloadAll}>
+                <FileArchive size={18} />
+                Download ZIP
+              </button>
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      {isWorking || progress.total > 0 ? (
+        <section className="progress-panel" aria-live="polite">
+          <div className="progress-text">
+            <span>{progress.label}</span>
+            <span>
+              {progress.current} / {progress.total}
+            </span>
+          </div>
+          <div className="progress-track">
+            <div className="progress-fill" style={{ width: `${progress.percent}%` }} />
+          </div>
+          {mode === 'video' && ffmpegMessage ? <p className="ffmpeg-log">{ffmpegMessage}</p> : null}
+        </section>
+      ) : null}
+
+      {results.length > 0 ? (
+        <section className="results-panel">
+          <div className="results-heading">
+            <div>
+              <span className="eyebrow">Results</span>
+              <h2>Conversion results</h2>
+            </div>
+            <div className="summary-pill">
+              {formatBytes(summary.original)} -&gt; {formatBytes(summary.converted)}
+              <strong>{formatSaving(summary.saved)}</strong>
+            </div>
+          </div>
+
+          <div className="results-grid">
+            {results.map((result) => (
+              <article className="result-card" key={result.id}>
+                {result.previewType === 'image' ? (
+                  <img src={result.url} alt="" className="result-preview" />
+                ) : (
+                  <video src={result.url} className="result-preview" controls />
+                )}
+                <div className="result-info">
+                  <strong>{result.outputName}</strong>
+                  <span>{result.sourceName}</span>
+                </div>
+                <div className="result-stats">
+                  <span>{formatBytes(result.originalSize)}</span>
+                  <span>{formatBytes(result.convertedSize)}</span>
+                  <strong>{formatSaving(((result.originalSize - result.convertedSize) / result.originalSize) * 100)}</strong>
+                </div>
+                <button className="download-button" type="button" onClick={() => downloadBlob(result.blob, result.outputName)}>
+                  <Download size={17} />
+                  Download
+                </button>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      <footer className="footer">
+        <Archive size={16} />
+        <span>Client-side conversion. Files stay on this device.</span>
+      </footer>
+    </main>
+  )
+}
+
+function StatusIcon({ status }: { status: FileStatus }) {
+  if (status === 'working') return <Loader2 className="status-icon spin" size={19} aria-label="Working" />
+  if (status === 'done') return <CheckCircle2 className="status-icon success" size={19} aria-label="Done" />
+  if (status === 'failed') return <XCircle className="status-icon error" size={19} aria-label="Failed" />
+  return <span className="status-dot" aria-label="Ready" />
+}
+
+function loadSettings(): ConverterSettings {
+  try {
+    const saved = localStorage.getItem(SETTINGS_KEY)
+    if (!saved) return DEFAULT_SETTINGS
+    const parsed = JSON.parse(saved) as Partial<ConverterSettings>
+    return {
+      ...DEFAULT_SETTINGS,
+      ...parsed,
+      theme: parsed.theme === 'light' || parsed.theme === 'dark' ? parsed.theme : DEFAULT_SETTINGS.theme,
+      imageFormat: isImageFormat(parsed.imageFormat) ? parsed.imageFormat : DEFAULT_SETTINGS.imageFormat,
+      videoFormat: isVideoFormat(parsed.videoFormat) ? parsed.videoFormat : DEFAULT_SETTINGS.videoFormat,
+      quality: clamp(Number(parsed.quality ?? DEFAULT_SETTINGS.quality), 0.1, 1),
+    }
+  } catch {
+    return DEFAULT_SETTINGS
+  }
+}
+
+function isImageFormat(value: unknown): value is ImageFormat {
+  return IMAGE_FORMATS.some((format) => format.value === value)
+}
+
+function isVideoFormat(value: unknown): value is VideoFormat {
+  return VIDEO_FORMATS.some((format) => format.value === value)
+}
+
+function parsePositiveNumber(value: string) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : null
+}
+
+function clamp(value: number, min: number, max: number) {
+  if (!Number.isFinite(value)) return min
+  return Math.min(max, Math.max(min, value))
+}
+
+function loadImage(file: File) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const image = new Image()
+    image.onload = () => {
+      URL.revokeObjectURL(url)
+      resolve(image)
+    }
+    image.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error('The image could not be decoded.'))
+    }
+    image.src = url
+  })
+}
+
+function calculateImageSize(
+  originalWidth: number,
+  originalHeight: number,
+  maxWidth: number | null,
+  maxHeight: number | null,
+  keepAspect: boolean,
+) {
+  if (!maxWidth && !maxHeight) return { width: originalWidth, height: originalHeight }
+
+  if (!keepAspect) {
+    return {
+      width: maxWidth ?? originalWidth,
+      height: maxHeight ?? originalHeight,
+    }
+  }
+
+  const widthScale = maxWidth ? maxWidth / originalWidth : 1
+  const heightScale = maxHeight ? maxHeight / originalHeight : 1
+  const scale = Math.min(1, widthScale, heightScale)
+
+  return {
+    width: Math.max(1, Math.round(originalWidth * scale)),
+    height: Math.max(1, Math.round(originalHeight * scale)),
+  }
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string, quality?: number) {
+  return new Promise<Blob | null>((resolve) => {
+    canvas.toBlob(resolve, mimeType, quality)
+  })
+}
+
+function buildVideoArgs(
+  inputName: string,
+  outputName: string,
+  format: VideoFormat,
+  quality: number,
+  maxWidth: number | null,
+  stripAudio: boolean,
+) {
+  const crf = String(Math.round(35 - quality * 17))
+  const vp9Crf = String(Math.round(48 - quality * 33))
+  const audioArgs = stripAudio ? ['-an'] : ['-map', '0:a:0?', '-c:a', 'aac', '-b:a', '128k']
+  const opusAudioArgs = stripAudio ? ['-an'] : ['-map', '0:a:0?', '-c:a', 'libopus', '-b:a', '96k']
+  const scaleFilter = maxWidth ? `scale=w='min(${maxWidth},iw)':h=-2` : ''
+  const videoMap = ['-map', '0:v:0']
+  const filterArgs = scaleFilter ? ['-vf', scaleFilter] : []
+
+  if (format === 'webm') {
+    return [
+      '-i',
+      inputName,
+      ...videoMap,
+      ...opusAudioArgs,
+      ...filterArgs,
+      '-c:v',
+      'libvpx-vp9',
+      '-b:v',
+      '0',
+      '-crf',
+      vp9Crf,
+      outputName,
+    ]
+  }
+
+  if (format === 'mov') {
+    return [
+      '-i',
+      inputName,
+      ...videoMap,
+      ...audioArgs,
+      ...filterArgs,
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-crf',
+      crf,
+      '-pix_fmt',
+      'yuv420p',
+      outputName,
+    ]
+  }
+
+  if (format === 'gif') {
+    const gifScale = maxWidth ? scaleFilter : "scale=w='min(720,iw)':h=-2"
+    return [
+      '-i',
+      inputName,
+      '-filter_complex',
+      `${gifScale},fps=12,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse`,
+      '-loop',
+      '0',
+      outputName,
+    ]
+  }
+
+  return [
+    '-i',
+    inputName,
+    ...videoMap,
+    ...audioArgs,
+    ...filterArgs,
+    '-c:v',
+    'libx264',
+    '-preset',
+    'veryfast',
+    '-crf',
+    crf,
+    '-pix_fmt',
+    'yuv420p',
+    '-movflags',
+    'faststart',
+    outputName,
+  ]
+}
+
+async function safeDelete(ffmpeg: FFmpeg, path: string) {
+  try {
+    await ffmpeg.deleteFile(path)
+  } catch {
+    // Missing files are fine after a failed conversion.
+  }
+}
+
+function buildOutputName(prefix: string, originalName: string, extension: string) {
+  const baseName = originalName.replace(/\.[^/.]+$/, '')
+  const safePrefix = sanitizeFilePart(prefix)
+  const safeBase = sanitizeFilePart(baseName) || 'media'
+  return `${safePrefix}${safeBase}.${extension}`
+}
+
+function sanitizeFilePart(value: string) {
+  const safe = Array.from(value, (character) => {
+    const code = character.charCodeAt(0)
+    return code < 32 || /[<>:"/\\|?*]/.test(character) ? '_' : character
+  }).join('')
+
+  return safe.replace(/\s+/g, '_')
+}
+
+function getExtension(fileName: string) {
+  const match = fileName.match(/\.([^.]+)$/)
+  return match ? sanitizeFilePart(match[1].toLowerCase()) : ''
+}
+
+function assetUrl(path: string) {
+  return new URL(`${import.meta.env.BASE_URL}${path}`, window.location.href).toString()
+}
+
+function makeId() {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID()
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function formatBytes(bytes: number) {
+  if (bytes === 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 2)} ${units[index]}`
+}
+
+function formatSaving(value: number) {
+  if (!Number.isFinite(value)) return '0% saved'
+  if (value < 0) return `${Math.abs(value).toFixed(1)}% larger`
+  return `${value.toFixed(1)}% saved`
+}
+
+function downloadBlob(blob: Blob, fileName: string) {
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = fileName
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
+}
+
+export default App
