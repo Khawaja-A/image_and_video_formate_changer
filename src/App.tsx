@@ -79,6 +79,7 @@ type ConversionResult = {
   outputName: string
   originalSize: number
   convertedSize: number
+  durationMs: number
   blob: Blob
   url: string
   previewType: Mode
@@ -188,8 +189,9 @@ function App() {
   const summary = useMemo(() => {
     const original = results.reduce((total, result) => total + result.originalSize, 0)
     const converted = results.reduce((total, result) => total + result.convertedSize, 0)
+    const durationMs = results.reduce((total, result) => total + result.durationMs, 0)
     const saved = original > 0 ? ((original - converted) / original) * 100 : 0
-    return { original, converted, saved }
+    return { original, converted, durationMs, saved }
   }, [results])
 
   useEffect(() => {
@@ -371,6 +373,7 @@ function App() {
   }
 
   async function convertImage(item: MediaFile): Promise<ConversionResult> {
+    const startedAt = getCurrentTime()
     const image = await loadImage(item.file)
     const size = calculateImageSize(
       image.naturalWidth,
@@ -415,6 +418,7 @@ function App() {
       outputName,
       originalSize: item.file.size,
       convertedSize: blob.size,
+      durationMs: getCurrentTime() - startedAt,
       blob,
       url: URL.createObjectURL(blob),
       previewType: 'image',
@@ -471,6 +475,7 @@ function App() {
   }
 
   async function convertVideo(item: MediaFile, index: number, total: number): Promise<ConversionResult> {
+    const startedAt = getCurrentTime()
     const tools = await ensureFfmpeg()
     const inputName = `input_${item.id}.${getExtension(item.file.name) || 'media'}`
     const outputName = buildOutputName(settings.filePrefix, item.file.name, videoFormat.extension)
@@ -542,6 +547,7 @@ function App() {
         outputName,
         originalSize: item.file.size,
         convertedSize: convertedBlob.size,
+        durationMs: getCurrentTime() - startedAt,
         blob: convertedBlob,
         url: URL.createObjectURL(convertedBlob),
         previewType: videoFormat.value === 'gif' ? 'image' : 'video',
@@ -1062,6 +1068,7 @@ function App() {
             <div className="summary-pill">
               {formatBytes(summary.original)} -&gt; {formatBytes(summary.converted)}
               <strong>{formatSaving(summary.saved)}</strong>
+              <span className="summary-time">Time: {formatDuration(summary.durationMs)}</span>
             </div>
           </div>
 
@@ -1081,6 +1088,10 @@ function App() {
                   <span>{formatBytes(result.originalSize)}</span>
                   <span>{formatBytes(result.convertedSize)}</span>
                   <strong>{formatSaving(((result.originalSize - result.convertedSize) / result.originalSize) * 100)}</strong>
+                </div>
+                <div className="result-time">
+                  <span>Converted in</span>
+                  <strong>{formatDuration(result.durationMs)}</strong>
                 </div>
                 <button className="download-button" type="button" onClick={() => downloadBlob(result.blob, result.outputName)}>
                   <Download size={17} />
@@ -1681,6 +1692,22 @@ function formatSaving(value: number) {
   if (!Number.isFinite(value)) return '0% saved'
   if (value < 0) return `${Math.abs(value).toFixed(1)}% larger`
   return `${value.toFixed(1)}% saved`
+}
+
+function getCurrentTime() {
+  return typeof performance === 'undefined' ? Date.now() : performance.now()
+}
+
+function formatDuration(milliseconds: number) {
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return '0 ms'
+  if (milliseconds < 1000) return `${Math.max(1, Math.round(milliseconds))} ms`
+
+  const seconds = milliseconds / 1000
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} sec`
+
+  const minutes = Math.floor(seconds / 60)
+  const remainingSeconds = Math.round(seconds % 60)
+  return `${minutes} min ${remainingSeconds} sec`
 }
 
 function downloadBlob(blob: Blob, fileName: string) {
