@@ -7,6 +7,7 @@ import {
   Download,
   FileArchive,
   Image as ImageIcon,
+  ImagePlus,
   Loader2,
   Moon,
   Play,
@@ -14,6 +15,7 @@ import {
   Settings2,
   Sun,
   Trash2,
+  Type,
   Upload,
   Video,
   XCircle,
@@ -35,11 +37,32 @@ const VIDEO_FORMATS = [
   { value: 'gif', label: 'GIF', extension: 'gif', mime: 'image/gif' },
 ] as const
 
+const WATERMARK_POSITIONS = [
+  { value: 'center-center', label: 'Center center' },
+  { value: 'center-top', label: 'Center top' },
+  { value: 'center-left', label: 'Center left' },
+  { value: 'center-right', label: 'Center right' },
+  { value: 'bottom-center', label: 'Bottom center' },
+  { value: 'bottom-right', label: 'Bottom right' },
+  { value: 'bottom-left', label: 'Bottom left' },
+  { value: 'top-left', label: 'Top left' },
+  { value: 'top-right', label: 'Top right' },
+] as const
+
+const WATERMARK_BACKDROPS = [
+  { value: 'none', label: 'No overlay' },
+  { value: 'dark', label: 'Dark overlay' },
+  { value: 'light', label: 'Light overlay' },
+] as const
+
 type Mode = 'image' | 'video'
 type Theme = 'light' | 'dark'
 type FileStatus = 'ready' | 'working' | 'done' | 'failed'
 type ImageFormat = (typeof IMAGE_FORMATS)[number]['value']
 type VideoFormat = (typeof VIDEO_FORMATS)[number]['value']
+type WatermarkPosition = (typeof WATERMARK_POSITIONS)[number]['value']
+type WatermarkBackdrop = (typeof WATERMARK_BACKDROPS)[number]['value']
+type WatermarkMode = 'text' | 'image'
 type FetchFile = (file?: string | File | Blob) => Promise<Uint8Array>
 
 type MediaFile = {
@@ -72,6 +95,21 @@ type ConverterSettings = {
   filePrefix: string
   videoMaxWidth: string
   stripAudio: boolean
+  watermarkEnabled: boolean
+  watermarkMode: WatermarkMode
+  watermarkText: string
+  watermarkFontSize: string
+  watermarkLogoSize: string
+  watermarkPosition: WatermarkPosition
+  watermarkColor: string
+  watermarkWeight: string
+  watermarkBackdrop: WatermarkBackdrop
+  watermarkOpacity: number
+}
+
+type WatermarkLogo = {
+  file: File
+  previewUrl: string
 }
 
 type FfmpegTools = {
@@ -97,6 +135,16 @@ const DEFAULT_SETTINGS: ConverterSettings = {
   filePrefix: 'converted_',
   videoMaxWidth: '1280',
   stripAudio: false,
+  watermarkEnabled: false,
+  watermarkMode: 'text',
+  watermarkText: 'Khawaja Abdul Rehman',
+  watermarkFontSize: '48',
+  watermarkLogoSize: '160',
+  watermarkPosition: 'bottom-right',
+  watermarkColor: '#ffffff',
+  watermarkWeight: '700',
+  watermarkBackdrop: 'dark',
+  watermarkOpacity: 0.82,
 }
 
 const SETTINGS_KEY = 'react-media-format-converter-settings'
@@ -112,6 +160,7 @@ function App() {
   const [isWorking, setIsWorking] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [ffmpegMessage, setFfmpegMessage] = useState('')
+  const [watermarkLogo, setWatermarkLogo] = useState<WatermarkLogo | null>(null)
   const [progress, setProgress] = useState<ProgressState>({
     label: 'Waiting',
     current: 0,
@@ -120,8 +169,10 @@ function App() {
   })
 
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const watermarkLogoInputRef = useRef<HTMLInputElement | null>(null)
   const filesRef = useRef<MediaFile[]>([])
   const resultsRef = useRef<ConversionResult[]>([])
+  const watermarkLogoRef = useRef<WatermarkLogo | null>(null)
   const ffmpegToolsRef = useRef<FfmpegTools | null>(null)
   const ffmpegLoadRef = useRef<Promise<FfmpegTools> | null>(null)
   const ffmpegLogRef = useRef<string[]>([])
@@ -155,9 +206,14 @@ function App() {
   }, [results])
 
   useEffect(() => {
+    watermarkLogoRef.current = watermarkLogo
+  }, [watermarkLogo])
+
+  useEffect(() => {
     return () => {
       filesRef.current.forEach((item) => URL.revokeObjectURL(item.previewUrl))
       resultsRef.current.forEach((result) => URL.revokeObjectURL(result.url))
+      if (watermarkLogoRef.current) URL.revokeObjectURL(watermarkLogoRef.current.previewUrl)
       ffmpegToolsRef.current?.ffmpeg.terminate()
     }
   }, [])
@@ -232,6 +288,35 @@ function App() {
     if (target) URL.revokeObjectURL(target.previewUrl)
     setFiles((current) => current.filter((item) => item.id !== id))
     resetOutput()
+  }
+
+  function handleWatermarkLogoInput(event: ChangeEvent<HTMLInputElement>) {
+    const [file] = Array.from(event.target.files ?? [])
+    event.target.value = ''
+
+    if (!file) return
+    if (!file.type.startsWith('image/')) {
+      setNotice('Choose an image file for the watermark logo.')
+      return
+    }
+
+    if (watermarkLogoRef.current) URL.revokeObjectURL(watermarkLogoRef.current.previewUrl)
+
+    const nextLogo = {
+      file,
+      previewUrl: URL.createObjectURL(file),
+    }
+
+    watermarkLogoRef.current = nextLogo
+    setWatermarkLogo(nextLogo)
+    updateSetting('watermarkMode', 'image')
+    updateSetting('watermarkEnabled', true)
+  }
+
+  function removeWatermarkLogo() {
+    if (watermarkLogoRef.current) URL.revokeObjectURL(watermarkLogoRef.current.previewUrl)
+    watermarkLogoRef.current = null
+    setWatermarkLogo(null)
   }
 
   async function convertAll() {
@@ -311,6 +396,7 @@ function App() {
     }
 
     context.drawImage(image, 0, 0, size.width, size.height)
+    await applyImageWatermark(context, canvas.width, canvas.height, settings, watermarkLogo?.file ?? null)
 
     const blob = await canvasToBlob(
       canvas,
@@ -719,6 +805,187 @@ function App() {
                     />
                     Maintain aspect ratio
                   </label>
+                  <div className="watermark-controls">
+                    <div className="watermark-heading">
+                      {settings.watermarkMode === 'text' ? <Type size={20} /> : <ImagePlus size={20} />}
+                      <div>
+                        <span className="eyebrow">Watermark</span>
+                        <h3>Image watermark</h3>
+                      </div>
+                    </div>
+
+                    <label className="toggle-row">
+                      <input
+                        type="checkbox"
+                        checked={settings.watermarkEnabled}
+                        onChange={(event) => updateSetting('watermarkEnabled', event.target.checked)}
+                        disabled={isWorking}
+                      />
+                      Add watermark to converted images
+                    </label>
+
+                    <div className="watermark-grid">
+                      <label className="field">
+                        <span>Watermark type</span>
+                        <select
+                          value={settings.watermarkMode}
+                          onChange={(event) => updateSetting('watermarkMode', event.target.value as WatermarkMode)}
+                          disabled={isWorking || !settings.watermarkEnabled}
+                        >
+                          <option value="text">Text</option>
+                          <option value="image">Logo / image</option>
+                        </select>
+                      </label>
+
+                      <label className="field">
+                        <span>Position</span>
+                        <select
+                          value={settings.watermarkPosition}
+                          onChange={(event) =>
+                            updateSetting('watermarkPosition', event.target.value as WatermarkPosition)
+                          }
+                          disabled={isWorking || !settings.watermarkEnabled}
+                        >
+                          {WATERMARK_POSITIONS.map((position) => (
+                            <option key={position.value} value={position.value}>
+                              {position.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      {settings.watermarkMode === 'text' ? (
+                        <>
+                          <label className="field wide">
+                            <span>Watermark text</span>
+                            <input
+                              type="text"
+                              value={settings.watermarkText}
+                              onChange={(event) => updateSetting('watermarkText', event.target.value)}
+                              disabled={isWorking || !settings.watermarkEnabled}
+                            />
+                          </label>
+
+                          <label className="field">
+                            <span>Font size (px)</span>
+                            <input
+                              type="number"
+                              min="8"
+                              max="500"
+                              value={settings.watermarkFontSize}
+                              onChange={(event) => updateSetting('watermarkFontSize', event.target.value)}
+                              disabled={isWorking || !settings.watermarkEnabled}
+                            />
+                          </label>
+
+                          <label className="field">
+                            <span>Boldness</span>
+                            <select
+                              value={settings.watermarkWeight}
+                              onChange={(event) => updateSetting('watermarkWeight', event.target.value)}
+                              disabled={isWorking || !settings.watermarkEnabled}
+                            >
+                              <option value="300">Light</option>
+                              <option value="400">Regular</option>
+                              <option value="600">Semi bold</option>
+                              <option value="700">Bold</option>
+                              <option value="800">Extra bold</option>
+                              <option value="900">Black</option>
+                            </select>
+                          </label>
+
+                          <label className="field">
+                            <span>Text color</span>
+                            <input
+                              className="color-input"
+                              type="color"
+                              value={settings.watermarkColor}
+                              onChange={(event) => updateSetting('watermarkColor', event.target.value)}
+                              disabled={isWorking || !settings.watermarkEnabled}
+                            />
+                          </label>
+                        </>
+                      ) : (
+                        <>
+                          <label className="field">
+                            <span>Logo size (px)</span>
+                            <input
+                              type="number"
+                              min="24"
+                              max="1200"
+                              value={settings.watermarkLogoSize}
+                              onChange={(event) => updateSetting('watermarkLogoSize', event.target.value)}
+                              disabled={isWorking || !settings.watermarkEnabled}
+                            />
+                          </label>
+
+                          <div className="logo-watermark-field">
+                            <input
+                              ref={watermarkLogoInputRef}
+                              type="file"
+                              accept="image/*"
+                              hidden
+                              onChange={handleWatermarkLogoInput}
+                            />
+                            <button
+                              className="secondary-button"
+                              type="button"
+                              onClick={() => watermarkLogoInputRef.current?.click()}
+                              disabled={isWorking || !settings.watermarkEnabled}
+                            >
+                              <ImagePlus size={17} />
+                              Choose Logo
+                            </button>
+                            {watermarkLogo ? (
+                              <>
+                                <img className="logo-watermark-preview" src={watermarkLogo.previewUrl} alt="" />
+                                <button
+                                  className="icon-button quiet"
+                                  type="button"
+                                  title="Remove watermark logo"
+                                  aria-label="Remove watermark logo"
+                                  onClick={removeWatermarkLogo}
+                                  disabled={isWorking}
+                                >
+                                  <Trash2 size={16} />
+                                </button>
+                              </>
+                            ) : (
+                              <span>No logo selected</span>
+                            )}
+                          </div>
+                        </>
+                      )}
+
+                      <label className="field">
+                        <span>Overlay style</span>
+                        <select
+                          value={settings.watermarkBackdrop}
+                          onChange={(event) => updateSetting('watermarkBackdrop', event.target.value as WatermarkBackdrop)}
+                          disabled={isWorking || !settings.watermarkEnabled}
+                        >
+                          {WATERMARK_BACKDROPS.map((backdrop) => (
+                            <option key={backdrop.value} value={backdrop.value}>
+                              {backdrop.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <label className="field">
+                        <span>Opacity: {Math.round(settings.watermarkOpacity * 100)}%</span>
+                        <input
+                          type="range"
+                          min="0.1"
+                          max="1"
+                          step="0.05"
+                          value={settings.watermarkOpacity}
+                          onChange={(event) => updateSetting('watermarkOpacity', Number(event.target.value))}
+                          disabled={isWorking || !settings.watermarkEnabled}
+                        />
+                      </label>
+                    </div>
+                  </div>
                 </>
               ) : (
                 <>
@@ -829,6 +1096,14 @@ function App() {
         <Archive size={16} />
         <span>Client-side conversion. Files stay on this device.</span>
       </footer>
+
+      <div className="developer-badge" aria-label="Developed by Khawaja Abdul Rehman">
+        <img src={assetUrl('khawaja-abdul-rehman.png')} alt="Khawaja Abdul Rehman" />
+        <div>
+          <span>Developed by</span>
+          <strong>Khawaja Abdul Rehman</strong>
+        </div>
+      </div>
     </main>
   )
 }
@@ -852,6 +1127,15 @@ function loadSettings(): ConverterSettings {
       imageFormat: isImageFormat(parsed.imageFormat) ? parsed.imageFormat : DEFAULT_SETTINGS.imageFormat,
       videoFormat: isVideoFormat(parsed.videoFormat) ? parsed.videoFormat : DEFAULT_SETTINGS.videoFormat,
       quality: clamp(Number(parsed.quality ?? DEFAULT_SETTINGS.quality), 0.1, 1),
+      watermarkEnabled: Boolean(parsed.watermarkEnabled ?? DEFAULT_SETTINGS.watermarkEnabled),
+      watermarkMode: parsed.watermarkMode === 'image' ? 'image' : DEFAULT_SETTINGS.watermarkMode,
+      watermarkPosition: isWatermarkPosition(parsed.watermarkPosition)
+        ? parsed.watermarkPosition
+        : DEFAULT_SETTINGS.watermarkPosition,
+      watermarkBackdrop: isWatermarkBackdrop(parsed.watermarkBackdrop)
+        ? parsed.watermarkBackdrop
+        : DEFAULT_SETTINGS.watermarkBackdrop,
+      watermarkOpacity: clamp(Number(parsed.watermarkOpacity ?? DEFAULT_SETTINGS.watermarkOpacity), 0.1, 1),
     }
   } catch {
     return DEFAULT_SETTINGS
@@ -864,6 +1148,14 @@ function isImageFormat(value: unknown): value is ImageFormat {
 
 function isVideoFormat(value: unknown): value is VideoFormat {
   return VIDEO_FORMATS.some((format) => format.value === value)
+}
+
+function isWatermarkPosition(value: unknown): value is WatermarkPosition {
+  return WATERMARK_POSITIONS.some((position) => position.value === value)
+}
+
+function isWatermarkBackdrop(value: unknown): value is WatermarkBackdrop {
+  return WATERMARK_BACKDROPS.some((backdrop) => backdrop.value === value)
 }
 
 function parsePositiveNumber(value: string) {
@@ -922,6 +1214,170 @@ function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string, quality?: num
   return new Promise<Blob | null>((resolve) => {
     canvas.toBlob(resolve, mimeType, quality)
   })
+}
+
+async function applyImageWatermark(
+  context: CanvasRenderingContext2D,
+  canvasWidth: number,
+  canvasHeight: number,
+  settings: ConverterSettings,
+  logoFile: File | null,
+) {
+  if (!settings.watermarkEnabled) return
+
+  if (settings.watermarkMode === 'image') {
+    if (!logoFile) return
+    const logo = await loadImage(logoFile)
+    drawImageWatermark(context, canvasWidth, canvasHeight, settings, logo)
+    return
+  }
+
+  const text = settings.watermarkText.trim()
+  if (!text) return
+
+  drawTextWatermark(context, canvasWidth, canvasHeight, settings, text)
+}
+
+function drawTextWatermark(
+  context: CanvasRenderingContext2D,
+  canvasWidth: number,
+  canvasHeight: number,
+  settings: ConverterSettings,
+  text: string,
+) {
+  const fontSize = clamp(parsePositiveNumber(settings.watermarkFontSize) ?? 48, 8, Math.max(canvasWidth, canvasHeight))
+  const fontWeight = String(clamp(Number(settings.watermarkWeight), 300, 900))
+  const padding = getWatermarkPadding(canvasWidth, canvasHeight)
+  const innerPadding = Math.max(8, Math.round(fontSize * 0.34))
+  const lineHeight = Math.round(fontSize * 1.2)
+
+  context.save()
+  context.font = `${fontWeight} ${fontSize}px Inter, ui-sans-serif, system-ui, sans-serif`
+  const metrics = context.measureText(text)
+  const textWidth = Math.ceil(metrics.width)
+  const textHeight = lineHeight
+  const box = {
+    width: textWidth + innerPadding * 2,
+    height: textHeight + innerPadding * 2,
+  }
+  const point = calculateWatermarkPoint(canvasWidth, canvasHeight, box.width, box.height, settings.watermarkPosition, padding)
+
+  drawWatermarkBackdrop(context, point.x, point.y, box.width, box.height, settings.watermarkBackdrop, fontSize)
+
+  context.globalAlpha = clamp(settings.watermarkOpacity, 0.1, 1)
+  context.fillStyle = settings.watermarkColor || '#ffffff'
+  context.textBaseline = 'middle'
+  context.textAlign = 'left'
+  context.shadowColor = 'rgb(0 0 0 / 0.36)'
+  context.shadowBlur = Math.max(2, Math.round(fontSize * 0.08))
+  context.shadowOffsetY = Math.max(1, Math.round(fontSize * 0.04))
+  context.fillText(text, point.x + innerPadding, point.y + box.height / 2)
+  context.restore()
+}
+
+function drawImageWatermark(
+  context: CanvasRenderingContext2D,
+  canvasWidth: number,
+  canvasHeight: number,
+  settings: ConverterSettings,
+  logo: HTMLImageElement,
+) {
+  const requestedSize = parsePositiveNumber(settings.watermarkLogoSize) ?? 160
+  const maxSize = Math.max(24, Math.round(Math.min(canvasWidth, canvasHeight) * 0.65))
+  const targetWidth = clamp(requestedSize, 24, maxSize)
+  const targetHeight = Math.max(1, Math.round(targetWidth * (logo.naturalHeight / logo.naturalWidth)))
+  const padding = getWatermarkPadding(canvasWidth, canvasHeight)
+  const innerPadding = Math.max(8, Math.round(targetWidth * 0.12))
+  const box = {
+    width: targetWidth + innerPadding * 2,
+    height: targetHeight + innerPadding * 2,
+  }
+  const point = calculateWatermarkPoint(canvasWidth, canvasHeight, box.width, box.height, settings.watermarkPosition, padding)
+
+  context.save()
+  drawWatermarkBackdrop(context, point.x, point.y, box.width, box.height, settings.watermarkBackdrop, targetWidth * 0.18)
+  context.globalAlpha = clamp(settings.watermarkOpacity, 0.1, 1)
+  context.drawImage(logo, point.x + innerPadding, point.y + innerPadding, targetWidth, targetHeight)
+  context.restore()
+}
+
+function getWatermarkPadding(canvasWidth: number, canvasHeight: number) {
+  return Math.max(16, Math.round(Math.min(canvasWidth, canvasHeight) * 0.04))
+}
+
+function calculateWatermarkPoint(
+  canvasWidth: number,
+  canvasHeight: number,
+  boxWidth: number,
+  boxHeight: number,
+  position: WatermarkPosition,
+  padding: number,
+) {
+  const horizontal = position.endsWith('left') ? 'left' : position.endsWith('right') ? 'right' : 'center'
+  const vertical = position.startsWith('top') || position.endsWith('top')
+    ? 'top'
+    : position.startsWith('bottom') || position.endsWith('bottom')
+      ? 'bottom'
+      : 'center'
+
+  const x =
+    horizontal === 'left'
+      ? padding
+      : horizontal === 'right'
+        ? canvasWidth - boxWidth - padding
+        : (canvasWidth - boxWidth) / 2
+  const y =
+    vertical === 'top'
+      ? padding
+      : vertical === 'bottom'
+        ? canvasHeight - boxHeight - padding
+        : (canvasHeight - boxHeight) / 2
+
+  return {
+    x: Math.round(Math.max(padding, Math.min(canvasWidth - boxWidth - padding, x))),
+    y: Math.round(Math.max(padding, Math.min(canvasHeight - boxHeight - padding, y))),
+  }
+}
+
+function drawWatermarkBackdrop(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  backdrop: WatermarkBackdrop,
+  radiusBase: number,
+) {
+  if (backdrop === 'none') return
+
+  context.save()
+  context.globalAlpha = 0.5
+  context.fillStyle = backdrop === 'dark' ? '#000000' : '#ffffff'
+  drawRoundRect(context, x, y, width, height, Math.max(8, Math.round(radiusBase * 0.28)))
+  context.fill()
+  context.restore()
+}
+
+function drawRoundRect(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  radius: number,
+) {
+  const safeRadius = Math.min(radius, width / 2, height / 2)
+  context.beginPath()
+  context.moveTo(x + safeRadius, y)
+  context.lineTo(x + width - safeRadius, y)
+  context.quadraticCurveTo(x + width, y, x + width, y + safeRadius)
+  context.lineTo(x + width, y + height - safeRadius)
+  context.quadraticCurveTo(x + width, y + height, x + width - safeRadius, y + height)
+  context.lineTo(x + safeRadius, y + height)
+  context.quadraticCurveTo(x, y + height, x, y + height - safeRadius)
+  context.lineTo(x, y + safeRadius)
+  context.quadraticCurveTo(x, y, x + safeRadius, y)
+  context.closePath()
 }
 
 function buildVideoArgs(
